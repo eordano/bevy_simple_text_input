@@ -31,16 +31,13 @@
 //! ```
 
 use bevy::{
-    ecs::{event::EventCursor, system::SystemParam},
+    ecs::{message::MessageCursor, system::SystemParam},
     input::keyboard::{Key, KeyboardInput},
     prelude::*,
-    tasks::IoTaskPool,
-    text::{
-        ComputedTextBlock, CosmicBuffer, CosmicFontSystem, LineBreak,
-        cosmic_text::{Action, Change, Cursor, Edit, Editor, Selection},
-    },
+    text::{ComputedTextBlock, CosmicBuffer, CosmicFontSystem, LineBreak},
     // ui::FocusPolicy,
 };
+use cosmic_text::{Action, Change, Cursor, Edit, Editor, Selection};
 use once_cell::unsync::Lazy;
 
 #[cfg(feature = "clipboard")]
@@ -56,8 +53,8 @@ pub struct TextInputSystem;
 impl Plugin for TextInputPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TextInputNavigationBindings>()
-            .add_event::<TextInputSubmitEvent>()
-            .add_event::<TextInputPointerEvent>()
+            .add_message::<TextInputSubmitEvent>()
+            .add_message::<TextInputPointerEvent>()
             .add_observer(create)
             .add_systems(
                 Update,
@@ -502,7 +499,7 @@ impl CosmicEditor {
 struct TextInputCursorDisplay;
 
 /// An event that is fired when the user presses the enter key.
-#[derive(Event)]
+#[derive(Message)]
 pub struct TextInputSubmitEvent {
     /// The text input that triggered the event.
     pub entity: Entity,
@@ -595,8 +592,8 @@ impl<T> TaskExt for bevy::tasks::Task<T> {
 #[allow(clippy::too_many_arguments)]
 fn keyboard(
     key_input: Res<ButtonInput<KeyCode>>,
-    input_events: Res<Events<KeyboardInput>>,
-    mut input_reader: Local<EventCursor<KeyboardInput>>,
+    input_events: Res<Messages<KeyboardInput>>,
+    mut input_reader: Local<MessageCursor<KeyboardInput>>,
     mut text_input_query: Query<(
         Entity,
         &TextInputSettings,
@@ -605,7 +602,7 @@ fn keyboard(
         &mut TextInputCursorTimer,
         &mut CosmicEditor,
     )>,
-    mut submit_writer: EventWriter<TextInputSubmitEvent>,
+    mut submit_writer: MessageWriter<TextInputSubmitEvent>,
     navigation: Res<TextInputNavigationBindings>,
     inner_text: InnerText,
     mut font_system: ResMut<CosmicFontSystem>,
@@ -707,7 +704,7 @@ fn keyboard(
                 }
 
                 use TextInputAction::*;
-                use bevy::text::cosmic_text::Motion;
+                use cosmic_text::Motion;
                 let mut timer_should_reset = true;
 
                 let editor_action = match action {
@@ -757,7 +754,7 @@ fn keyboard(
                     Cut | Copy => {
                         {
                             if let Some(selection) = editor.editor.copy_selection() {
-                                IoTaskPool::get()
+                                bevy::tasks::IoTaskPool::get()
                                     .spawn(async move {
                                         let result = match ClipboardContext::new() {
                                             Ok(mut ctx) => ctx
@@ -788,7 +785,7 @@ fn keyboard(
                     Paste => {
                         *clipboard_read = Some((
                             input_entity,
-                            IoTaskPool::get().spawn(async {
+                            bevy::tasks::IoTaskPool::get().spawn(async {
                                 let Ok(mut ctx) = ClipboardContext::new() else {
                                     return Err("can't get clipboard".to_owned());
                                 };
@@ -944,7 +941,7 @@ pub enum TextInputPointerAction {
 }
 
 /// TextInputPointerEvent
-#[derive(Event, Debug)]
+#[derive(Message, Debug)]
 pub struct TextInputPointerEvent {
     /// TextInputPointerEvent
     pub position: Vec2,
@@ -954,7 +951,7 @@ pub struct TextInputPointerEvent {
 
 #[allow(clippy::too_many_arguments)]
 fn pointer(
-    mut events: EventReader<TextInputPointerEvent>,
+    mut events: MessageReader<TextInputPointerEvent>,
     mut last_action: Local<Option<(Entity, f32, usize)>>,
     mut buffers: Query<(&TextInputInactive, Entity, &mut CosmicEditor)>,
     mut font_system: ResMut<CosmicFontSystem>,
@@ -1046,7 +1043,7 @@ fn update_value(
 }
 
 fn create(
-    trigger: Trigger<OnAdd, TextInputValue>,
+    trigger: On<Add, TextInputValue>,
     mut commands: Commands,
     query: Query<(
         &TextInputTextFont,
@@ -1057,9 +1054,8 @@ fn create(
         &TextInputPlaceholder,
     )>,
 ) {
-    if let Ok((font, color, text_input, inactive, settings, placeholder)) =
-        &query.get(trigger.target())
-    {
+    let target = trigger.event().entity;
+    if let Ok((font, color, text_input, inactive, settings, placeholder)) = &query.get(target) {
         let value = masked_value(&text_input.0, settings.mask_character);
 
         let text = commands
@@ -1181,12 +1177,12 @@ fn create(
 
         commands.entity(overflow_container).add_child(container);
         commands
-            .entity(trigger.target())
+            .entity(target)
             .add_children(&[overflow_container, placeholder_text]);
 
         // Prevent clicks from registering on UI elements underneath the text input.
         commands
-            .entity(trigger.target())
+            .entity(target)
             // .insert(FocusPolicy::Block)
             .insert(CosmicEditor::new(&text_input.0));
     }
@@ -1272,7 +1268,7 @@ fn set_positions(
         if editor.editor.cursor_position().is_none() {
             editor.editor.action(
                 &mut font_system,
-                Action::Motion(bevy::text::cosmic_text::Motion::BufferEnd),
+                Action::Motion(cosmic_text::Motion::BufferEnd),
             );
         }
         editor.editor.shape_as_needed(&mut font_system, false);

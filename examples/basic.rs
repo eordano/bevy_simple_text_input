@@ -41,7 +41,7 @@ fn setup(mut commands: Commands) {
                     padding: UiRect::all(Val::Px(5.0)),
                     ..default()
                 },
-                BorderColor(BORDER_COLOR_ACTIVE),
+                BorderColor::all(BORDER_COLOR_ACTIVE),
                 BackgroundColor(BACKGROUND_COLOR),
                 TextInput,
                 TextInputTextFont(TextFont {
@@ -54,7 +54,7 @@ fn setup(mut commands: Commands) {
         });
 }
 
-fn listener(mut events: EventReader<TextInputSubmitEvent>) {
+fn listener(mut events: MessageReader<TextInputSubmitEvent>) {
     for event in events.read() {
         info!("{:?} submitted: {}", event.entity, event.value);
     }
@@ -65,7 +65,7 @@ fn send_mouse(
     button: Res<ButtonInput<MouseButton>>,
     mut was_pressed: Local<bool>,
     mut prev_pos: Local<Vec2>,
-    mut pointer: EventWriter<TextInputPointerEvent>,
+    mut pointer: MessageWriter<TextInputPointerEvent>,
     interaction_check: Query<&Interaction, With<TextInput>>,
 ) {
     let just_pressed = button.just_pressed(MouseButton::Left);
