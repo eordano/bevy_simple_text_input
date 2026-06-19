@@ -902,7 +902,7 @@ impl TextPositionFinder<'_, '_> {
             mut index,
             ..
         } = self.cursor_hit(entity, position)?;
-        for (entity, _, text, _, _) in self.reader.iter(entity) {
+        for (entity, _, text, _, _, _) in self.reader.iter(entity) {
             let mut parts = text.split('\n');
             let line_breaks = parts.clone().count() - 1;
             if line_breaks < line {

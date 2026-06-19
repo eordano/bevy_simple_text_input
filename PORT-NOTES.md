@@ -82,3 +82,63 @@ feature configuration builds warning-free.
 
 Clean (no warnings) under dcl-shell with `cargo build`, `cargo build --examples`,
 and `cargo build --no-default-features --features std`.
+
+---
+
+# Port notes: bevy 0.17 -> 0.18
+
+This branch (`0.18`) continues the port to Bevy 0.18 (0.18.1 from crates.io).
+
+## Cargo.toml
+
+- Bumped `bevy` (both `[dependencies]` and `[dev-dependencies]`) from `0.17.3`
+  to `0.18.1`.
+- Bumped the direct `cosmic-text` dependency from `0.14` to `0.16`, matching the
+  version `bevy_text` 0.18.1 uses (`cosmic-text = { version = "0.16", features =
+  ["shape-run-cache"] }`). This keeps `CosmicBuffer.0`, `CosmicFontSystem.0`, and
+  `ComputedTextBlock::buffer()` interoperable with the same `Buffer`/`FontSystem`
+  types, and the cosmic-text API surface this crate uses (`Action`, `Change`,
+  `Cursor`, `Edit`, `Editor`, `Selection`, `Motion`) is unchanged across
+  0.14 -> 0.16.
+- `bevy_sprite` feature kept (still where some UI/text glue lives).
+
+## TextUiReader item tuple gained LineHeight
+
+In 0.18 `LineHeight` was removed from `TextFont` and is now its own component
+required by `Text`/`Text2d`/`TextSpan`. As a knock-on, `TextUiReader::iter`
+yields a 6-tuple that now includes the resolved `LineHeight`:
+
+- `(Entity, usize, &str, &TextFont, Color)` ->
+  `(Entity, usize, &str, &TextFont, Color, LineHeight)`
+
+Fix (in `TextPositionFinder::cursor_entity`):
+
+- `for (entity, _, text, _, _) in self.reader.iter(entity)` ->
+  `for (entity, _, text, _, _, _) in self.reader.iter(entity)`
+
+This crate never set `TextFont.line_height`, so no `TextFont` construction sites
+needed changing, and it doesn't insert/read a `LineHeight` component directly.
+
+## Items from the 0.17 -> 0.18 migration guide that did NOT apply
+
+- **Entity-event immutability / `SetEntityEventTarget`**: the crate never builds
+  entity events manually or calls `set_target`, so nothing changed. The `create`
+  observer's `On<Add, TextInputValue>` + `trigger.event().entity` form (already
+  used on the 0.17 branch) is still valid in 0.18.
+- **`BorderRadius` -> `Node` field**: the crate and examples don't use
+  `BorderRadius`.
+- **`BorderColor`**: unchanged from 0.17 (still the per-side struct with
+  `::all`/`::from`/`set_all`); examples already use the 0.17 form.
+- **`TextLayoutInfo.section_rects` -> `run_geometry`**: not used; selection
+  geometry is computed directly from cosmic-text `layout_runs()`/glyphs, not from
+  `TextLayoutInfo`.
+- **Observer `Trigger` -> `On`**: already migrated on the 0.17 branch (lib +
+  `examples/focus.rs`); no further change.
+
+## Build status (0.18)
+
+Clean (no warnings) under dcl-shell with `cargo build`, `cargo build --examples`,
+and `cargo build --no-default-features --features std`. The only remaining
+`cargo clippy` notes (a `.clone()` on a `Copy` `Option<TextColor>` and two
+collapsible `if`s) are pre-existing on the 0.17 branch in unchanged code and are
+unrelated to the port.
