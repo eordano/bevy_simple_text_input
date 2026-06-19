@@ -1,7 +1,7 @@
 //! An example showing a more advanced implementation with focus.
 
 use bevy::{
-    input_focus::{InputDispatchPlugin, InputFocus},
+    input_focus::{FocusCause, InputDispatchPlugin, InputFocus},
     prelude::*,
 };
 use bevy_simple_text_input::{
@@ -55,7 +55,7 @@ fn text_input() -> impl Bundle {
         BackgroundColor(BACKGROUND_COLOR),
         TextInput,
         TextInputTextFont(TextFont {
-            font_size: 34.,
+            font_size: FontSize::Px(34.),
             ..default()
         }),
         TextInputTextColor(TextColor(TEXT_COLOR)),
@@ -76,7 +76,7 @@ fn focus(
     }
 
     for (entity, mut inactive, mut border_color) in text_inputs.iter_mut() {
-        if focus.0 == Some(entity) {
+        if focus.get() == Some(entity) {
             inactive.0 = false;
             *border_color = BORDER_COLOR_ACTIVE.into();
         } else {
@@ -87,11 +87,11 @@ fn focus(
 }
 
 fn background_node_click(mut trigger: On<Pointer<Click>>, mut focus: ResMut<InputFocus>) {
-    focus.0 = None;
+    focus.clear();
     trigger.propagate(false);
 }
 
 fn text_input_click(mut trigger: On<Pointer<Click>>, mut focus: ResMut<InputFocus>) {
-    focus.0 = Some(trigger.event().entity);
+    focus.set(trigger.event().entity, FocusCause::Pressed);
     trigger.propagate(false);
 }

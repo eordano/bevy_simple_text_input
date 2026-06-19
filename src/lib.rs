@@ -1,4 +1,20 @@
-//! A Bevy plugin the provides a simple single-line text input widget.
+//! A Bevy plugin that provides a simple single-line text input widget.
+//!
+//! # Bevy 0.19 / Parley note
+//!
+//! Bevy 0.19 replaced its text engine (Cosmic Text) with Parley and grew a
+//! *native* editable-text widget ([`bevy::text::EditableText`], driven by a
+//! [`parley::PlainEditor`]). The cosmic-text based editing/cursor/selection
+//! engine this crate used through 0.18 no longer has a backing buffer to talk
+//! to: `ComputedTextBlock::buffer()` is now a `parley::Layout`, and
+//! `CosmicBuffer`/`CosmicFontSystem`/`Editor`/`Action`/`Change`/`Selection`
+//! were all removed from `bevy_text`.
+//!
+//! This branch therefore re-implements the crate's internals on top of Bevy's
+//! own [`EditableText`]/[`PlainEditor`], while preserving the public API
+//! ([`TextInput`], [`TextInputValue`], [`TextInputSubmitEvent`], etc.) that
+//! downstream consumers depend on. See `PORT-NOTES.md` for the full rationale
+//! and the list of behaviours that changed.
 //!
 //! # Examples
 //!
@@ -25,23 +41,17 @@
 //!             border: UiRect::all(Val::Px(2.0)),
 //!             ..default()
 //!         },
-//!         BorderColor(Color::BLACK)
+//!         BorderColor::all(Color::BLACK),
 //!     ));
 //! }
 //! ```
 
 use bevy::{
-    ecs::{message::MessageCursor, system::SystemParam},
+    ecs::message::MessageCursor,
     input::keyboard::{Key, KeyboardInput},
     prelude::*,
-    text::{ComputedTextBlock, CosmicBuffer, CosmicFontSystem, LineBreak},
-    // ui::FocusPolicy,
+    text::{EditableText, TextCursorStyle, TextEdit},
 };
-use cosmic_text::{Action, Change, Cursor, Edit, Editor, Selection};
-use once_cell::unsync::Lazy;
-
-#[cfg(feature = "clipboard")]
-use copypwasmta::{ClipboardContext, ClipboardProvider};
 
 /// A Bevy `Plugin` providing the systems and assets required to make a [`TextInput`] work.
 pub struct TextInputPlugin;
@@ -52,6 +62,19 @@ pub struct TextInputSystem;
 
 impl Plugin for TextInputPlugin {
     fn build(&self, app: &mut App) {
+        // `EditableText`'s rendering requires `TextScroll`, `TextNodeFlags` and
+        // `ContentSize` on the same entity. Bevy only registers these as required
+        // components inside `bevy_ui_widgets::EditableTextInputPlugin`, which we
+        // deliberately do *not* add (it would install Bevy's own keyboard / pointer
+        // / focus handling, conflicting with this crate's custom input handling).
+        // Register them ourselves so the native text layout/render path matches our
+        // `EditableText` entities even with a plain `DefaultPlugins` app.
+        use bevy::ui::{widget::TextNodeFlags, widget::TextScroll, ContentSize};
+        app.register_required_components::<EditableText, Node>()
+            .register_required_components::<EditableText, TextNodeFlags>()
+            .register_required_components::<EditableText, ContentSize>()
+            .register_required_components::<EditableText, TextScroll>();
+
         app.init_resource::<TextInputNavigationBindings>()
             .add_message::<TextInputSubmitEvent>()
             .add_message::<TextInputPointerEvent>()
@@ -59,12 +82,10 @@ impl Plugin for TextInputPlugin {
             .add_systems(
                 Update,
                 (
-                    blink_cursor,
-                    set_positions,
-                    set_selection,
+                    sync_settings,
+                    sync_style,
+                    sync_inactive,
                     show_hide_placeholder,
-                    update_style,
-                    update_placeholder_style,
                     keyboard,
                     pointer,
                     update_value,
@@ -110,11 +131,11 @@ impl Plugin for TextInputPlugin {
 )]
 pub struct TextInput;
 
-/// The Bevy `TextColor` that will be used when creating the text input's inner Bevy `TextBundle`.
+/// The Bevy `TextFont` that will be used when creating the text input's inner text.
 #[derive(Component, Default, Reflect)]
 pub struct TextInputTextFont(pub TextFont);
 
-/// The Bevy `TextColor` that will be used when creating the text input's inner Bevy `TextBundle`.
+/// The Bevy `TextColor` that will be used when creating the text input's inner text.
 #[derive(Component, Default, Reflect)]
 pub struct TextInputTextColor(pub TextColor);
 
@@ -127,17 +148,16 @@ pub struct TextInputSelectionStyle {
     pub background: Option<Color>,
 }
 
-#[derive(Component)]
-struct TextInputSelection;
-
-#[derive(Component)]
-struct TextInputContainer;
-
 /// If true, the text input does not respond to keyboard events and the cursor is hidden.
 #[derive(Component, Default, Reflect)]
 pub struct TextInputInactive(pub bool);
 
 /// A component that manages the cursor's blinking.
+///
+/// Retained for API compatibility. Cursor blinking itself is now handled by
+/// Bevy's native [`EditableText`] rendering; this component is still accepted on
+/// text input entities (the app inserts it) but is no longer wired to a custom
+/// blink system.
 #[derive(Component, Reflect)]
 pub struct TextInputCursorTimer {
     /// The timer that blinks the cursor on and off, and resets when the user types.
@@ -162,6 +182,10 @@ pub struct TextInputSettings {
     /// If true, text is not cleared after pressing enter.
     pub retain_on_submit: bool,
     /// Mask text with the provided character.
+    ///
+    /// Note: native [`EditableText`] rendering does not currently support
+    /// character masking, so this setting is accepted but not yet honoured on
+    /// the 0.19 (Parley) branch. See `PORT-NOTES.md`.
     pub mask_character: Option<char>,
 }
 
@@ -199,17 +223,14 @@ pub enum TextInputAction {
     /// select full buffer
     SelectAll,
     /// cut
-    #[cfg(feature = "clipboard")]
     Cut,
     /// copy
-    #[cfg(feature = "clipboard")]
     Copy,
     /// pasta
-    #[cfg(feature = "clipboard")]
     Paste,
-    /// undo
+    /// undo (no-op on the 0.19 branch; `EditableText` does not yet support undo/redo)
     Undo,
-    /// redo
+    /// redo (no-op on the 0.19 branch; `EditableText` does not yet support undo/redo)
     Redo,
 }
 /// A resource in which key bindings can be specified. Bindings are given as a tuple of (`TextInputAction`, `TextInputBinding`).
@@ -279,32 +300,26 @@ impl TextInputNavigationBindings {
             (Submit, TextInputBinding::new(NumpadEnter, [])),
             (SelectAll, TextInputBinding::new(KeyA, [ControlLeft])),
             (SelectAll, TextInputBinding::new(KeyA, [ControlRight])),
-            #[cfg(feature = "clipboard")]
             (
                 TextInputAction::Cut,
                 TextInputBinding::new(KeyX, [ControlLeft]),
             ),
-            #[cfg(feature = "clipboard")]
             (
                 TextInputAction::Cut,
                 TextInputBinding::new(KeyX, [ControlRight]),
             ),
-            #[cfg(feature = "clipboard")]
             (
                 TextInputAction::Copy,
                 TextInputBinding::new(KeyC, [ControlLeft]),
             ),
-            #[cfg(feature = "clipboard")]
             (
                 TextInputAction::Copy,
                 TextInputBinding::new(KeyC, [ControlRight]),
             ),
-            #[cfg(feature = "clipboard")]
             (
                 TextInputAction::Paste,
                 TextInputBinding::new(KeyV, [ControlLeft]),
             ),
-            #[cfg(feature = "clipboard")]
             (
                 TextInputAction::Paste,
                 TextInputBinding::new(KeyV, [ControlRight]),
@@ -368,32 +383,26 @@ impl TextInputNavigationBindings {
             (Submit, TextInputBinding::new(NumpadEnter, [])),
             (SelectAll, TextInputBinding::new(KeyA, [SuperLeft])),
             (SelectAll, TextInputBinding::new(KeyA, [SuperRight])),
-            #[cfg(feature = "clipboard")]
             (
                 TextInputAction::Cut,
                 TextInputBinding::new(KeyX, [SuperLeft]),
             ),
-            #[cfg(feature = "clipboard")]
             (
                 TextInputAction::Cut,
                 TextInputBinding::new(KeyX, [SuperRight]),
             ),
-            #[cfg(feature = "clipboard")]
             (
                 TextInputAction::Copy,
                 TextInputBinding::new(KeyC, [SuperLeft]),
             ),
-            #[cfg(feature = "clipboard")]
             (
                 TextInputAction::Copy,
                 TextInputBinding::new(KeyC, [SuperRight]),
             ),
-            #[cfg(feature = "clipboard")]
             (
                 TextInputAction::Paste,
                 TextInputBinding::new(KeyV, [SuperLeft]),
             ),
-            #[cfg(feature = "clipboard")]
             (
                 TextInputAction::Paste,
                 TextInputBinding::new(KeyV, [SuperRight]),
@@ -454,50 +463,6 @@ struct TextInputPlaceholderInner;
 #[derive(Component, Reflect)]
 struct TextInputInner;
 
-#[derive(Component)]
-struct CosmicEditor {
-    editor: Editor<'static>,
-    selection_bounds: Option<(usize, usize)>,
-    undo: Vec<Change>,
-    redo: Vec<Change>,
-}
-
-impl CosmicEditor {
-    fn new(text: &str) -> Self {
-        let mut editor = Editor::new(CosmicBuffer::default().0);
-        editor.insert_string(text, None);
-        Self {
-            editor,
-            selection_bounds: None,
-            undo: Vec::default(),
-            redo: Vec::default(),
-        }
-    }
-
-    fn update_selection_bounds(&mut self) {
-        self.selection_bounds = self.editor.selection_bounds().map(|(from, to)| {
-            let index = |c: Cursor| -> usize {
-                self.editor.with_buffer(|b| {
-                    let mut lines = b.lines.iter();
-
-                    let prior_sum: usize = lines
-                        .by_ref()
-                        .take(c.line)
-                        .map(|line| line.text().len() + 1)
-                        .sum();
-
-                    prior_sum + c.index
-                })
-            };
-
-            (index(from), index(to))
-        });
-    }
-}
-
-#[derive(Component)]
-struct TextInputCursorDisplay;
-
 /// An event that is fired when the user presses the enter key.
 #[derive(Message)]
 pub struct TextInputSubmitEvent {
@@ -507,89 +472,11 @@ pub struct TextInputSubmitEvent {
     pub value: String,
 }
 
-/// A convenience parameter for dealing with a text input's inner Bevy `Text` entity.
-#[derive(SystemParam)]
-struct InnerText<'w, 's> {
-    inner_query: Query<'w, 's, Entity, With<TextInputInner>>,
-    computed_text_query: Query<'w, 's, &'static ComputedTextBlock, With<TextInputInner>>,
-    computed_node_query: Query<'w, 's, &'static ComputedNode, With<TextInputInner>>,
-    cursor_query: Query<
-        'w,
-        's,
-        (&'static mut Node, &'static mut BackgroundColor),
-        With<TextInputCursorDisplay>,
-    >,
-    children_query: Query<'w, 's, &'static Children>,
-}
-impl InnerText<'_, '_> {
-    fn computed_text(&self, entity: Entity) -> Option<&ComputedTextBlock> {
-        self.computed_text_query
-            .get(self.inner_entity(entity)?)
-            .ok()
-    }
-
-    fn computed_node(&self, entity: Entity) -> Option<&ComputedNode> {
-        self.computed_node_query
-            .get(self.inner_entity(entity)?)
-            .ok()
-    }
-
-    fn cursor_style(&mut self, entity: Entity) -> Option<(&mut Node, &mut BackgroundColor)> {
-        self.cursor_query
-            .get_mut(
-                self.children_query
-                    .iter_descendants(entity)
-                    .find(|d| self.cursor_query.get(*d).is_ok())?,
-            )
-            .ok()
-            .map(|(node, bg)| (node.into_inner(), bg.into_inner()))
-    }
-
-    fn inner_entity(&self, entity: Entity) -> Option<Entity> {
-        self.children_query
-            .iter_descendants(entity)
-            .find(|descendant_entity| self.inner_query.get(*descendant_entity).is_ok())
-    }
-}
-
-// get results from a task
-#[cfg(feature = "clipboard")]
-trait TaskExt {
-    type Output;
-
-    fn complete(&mut self) -> Option<Self::Output>;
-}
-
-#[cfg(feature = "clipboard")]
-impl<T> TaskExt for bevy::tasks::Task<T> {
-    type Output = T;
-
-    #[cfg(target_arch = "wasm32")]
-    fn complete(&mut self) -> Option<Self::Output> {
-        use futures_lite::FutureExt;
-        // wasm doesn't have `is_finished``, but polling is cheap as it is just a oneshot receiver
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        if let std::task::Poll::Ready(res) = self.poll(&mut context) {
-            Some(res)
-        } else {
-            None
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn complete(&mut self) -> Option<Self::Output> {
-        match self.is_finished() {
-            true => Some(
-                futures_lite::future::block_on(futures_lite::future::poll_once(self))
-                    .expect("is_finished but !Some?"),
-            ),
-
-            false => None,
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
+/// Reads keyboard input and applies it to the focused text input's [`EditableText`].
+///
+/// Edits are queued onto [`EditableText::pending_edits`] and applied by Bevy's
+/// own `apply_text_edits` system; we only read the resulting value back into
+/// [`TextInputValue`] in [`update_value`].
 fn keyboard(
     key_input: Res<ButtonInput<KeyCode>>,
     input_events: Res<Messages<KeyboardInput>>,
@@ -600,28 +487,12 @@ fn keyboard(
         &TextInputInactive,
         &mut TextInputValue,
         &mut TextInputCursorTimer,
-        &mut CosmicEditor,
+        &mut EditableText,
     )>,
     mut submit_writer: MessageWriter<TextInputSubmitEvent>,
     navigation: Res<TextInputNavigationBindings>,
-    inner_text: InnerText,
-    mut font_system: ResMut<CosmicFontSystem>,
-    #[cfg(feature = "clipboard")] mut clipboard_read: Local<
-        Option<(Entity, bevy::tasks::Task<Result<String, String>>)>,
-    >,
 ) {
-    #[allow(unused_mut)]
-    let mut copy_text: Option<(Entity, Result<String, String>)> = None;
-
-    #[cfg(feature = "clipboard")]
-    if let Some((ent, read_task)) = clipboard_read.as_mut() {
-        if let Some(result) = read_task.complete() {
-            copy_text = Some((*ent, result));
-            *clipboard_read = None;
-        }
-    }
-
-    if copy_text.is_none() && input_reader.clone().read(&input_events).next().is_none() {
+    if input_reader.clone().read(&input_events).next().is_none() {
         return;
     }
 
@@ -644,48 +515,6 @@ fn keyboard(
         }
 
         let mut submitted_value = None;
-        let mut is_undo_redo = false;
-
-        // use a lazy cell to avoid initializing the editor if not required (copying the buffer is expensive)
-        let mut editor = Lazy::new(|| {
-            let base_cursor = editor.editor.cursor();
-            let mut fixed_cursor = editor.editor.cursor();
-            editor.editor.with_buffer_mut(|b| {
-                b.clone_from(&inner_text.computed_text(input_entity).unwrap().buffer().0);
-
-                // valid line indices are 0..b.lines.len(); using ..=len causes
-                // cosmic-text's shape_until_cursor to panic when the buffer just shrank
-                fixed_cursor.line = fixed_cursor.line.min(b.lines.len().saturating_sub(1));
-                fixed_cursor.index = fixed_cursor.index.min(
-                    b.lines
-                        .get(fixed_cursor.line)
-                        .map(|l| l.text().len())
-                        .unwrap_or(0),
-                );
-            });
-            if fixed_cursor != base_cursor {
-                editor.editor.set_cursor(fixed_cursor);
-            }
-            editor.editor.start_change();
-            editor
-        });
-
-        #[cfg(feature = "clipboard")]
-        if let Some(copy_result) = copy_text
-            .clone()
-            .filter(|(copy_ent, _)| input_entity == *copy_ent)
-            .map(|(_, result)| result)
-        {
-            match copy_result {
-                Ok(text) => {
-                    editor.editor.delete_selection();
-                    editor
-                        .editor
-                        .insert_string(&text.replace("\r\n", "\n"), None);
-                }
-                Err(err) => warn!("failed to read clipboard: {err}"),
-            }
-        }
 
         for input in input_reader.clone().read(&input_events) {
             if !input.state.is_pressed() {
@@ -696,31 +525,23 @@ fn keyboard(
                 .clone()
                 .find(|(key, _)| *key == input.key_code)
             {
-                let mut select = select;
-
-                if select && editor.editor.selection() == Selection::None {
-                    let cursor = editor.editor.cursor();
-                    editor.editor.set_selection(Selection::Normal(cursor));
-                }
-
                 use TextInputAction::*;
-                use cosmic_text::Motion;
                 let mut timer_should_reset = true;
 
-                let editor_action = match action {
-                    CharLeft => Some(Action::Motion(Motion::Left)),
-                    CharRight => Some(Action::Motion(Motion::Right)),
-                    TextStart => Some(Action::Motion(Motion::BufferStart)),
-                    TextEnd => Some(Action::Motion(Motion::BufferEnd)),
-                    LineStart => Some(Action::Motion(Motion::Home)),
-                    LineEnd => Some(Action::Motion(Motion::End)),
-                    WordLeft => Some(Action::Motion(Motion::LeftWord)),
-                    WordRight => Some(Action::Motion(Motion::RightWord)),
-                    LineUp => Some(Action::Motion(Motion::Up)),
-                    LineDown => Some(Action::Motion(Motion::Down)),
-                    DeletePrev => Some(Action::Backspace),
-                    DeleteNext => Some(Action::Delete),
-                    NewLine if settings.multiline => Some(Action::Enter),
+                let edit = match action {
+                    CharLeft => Some(TextEdit::Left(select)),
+                    CharRight => Some(TextEdit::Right(select)),
+                    TextStart => Some(TextEdit::TextStart(select)),
+                    TextEnd => Some(TextEdit::TextEnd(select)),
+                    LineStart => Some(TextEdit::LineStart(select)),
+                    LineEnd => Some(TextEdit::LineEnd(select)),
+                    WordLeft => Some(TextEdit::WordLeft(select)),
+                    WordRight => Some(TextEdit::WordRight(select)),
+                    LineUp => Some(TextEdit::Up(select)),
+                    LineDown => Some(TextEdit::Down(select)),
+                    DeletePrev => Some(TextEdit::Backspace),
+                    DeleteNext => Some(TextEdit::Delete),
+                    NewLine if settings.multiline => Some(TextEdit::Insert("\n".into())),
                     // NewLine here only fires in single-line mode (guarded arm above takes priority)
                     Submit | NewLine => {
                         let retain = settings.retain_on_submit;
@@ -730,105 +551,23 @@ fn keyboard(
                             submitted_value = Some(std::mem::take(&mut text_input.0));
                         };
                         timer_should_reset = false;
-                        // submit may be triggered with shift held; ensure selection is dropped
-                        // so cosmic-text doesn't try to shape a stale anchor next frame
-                        select = false;
-                        // when clearing, reset cursor to start of the now-empty buffer;
-                        // when retaining, leave the cursor where it was
                         if retain {
                             None
                         } else {
-                            Some(Action::Motion(Motion::BufferStart))
+                            editor.clear();
+                            None
                         }
                     }
-                    SelectAll => {
-                        editor
-                            .editor
-                            .set_selection(Selection::Normal(Cursor::default()));
-
-                        select = true;
-
-                        Some(Action::Motion(Motion::BufferEnd))
-                    }
-                    #[cfg(feature = "clipboard")]
-                    Cut | Copy => {
-                        {
-                            if let Some(selection) = editor.editor.copy_selection() {
-                                bevy::tasks::IoTaskPool::get()
-                                    .spawn(async move {
-                                        let result = match ClipboardContext::new() {
-                                            Ok(mut ctx) => ctx
-                                                .set_contents(selection)
-                                                .await
-                                                .map_err(|e| e.to_string()),
-                                            Err(e) => Err(e.to_string()),
-                                        };
-
-                                        if let Err(e) = result {
-                                            warn!("failed to copy to clipboard: {e:?}");
-                                        }
-                                    })
-                                    .detach();
-                            }
-                        }
-
-                        if let Cut = action {
-                            editor.editor.delete_selection();
-                        } else {
-                            // avoid clearing selection on copy
-                            select = true;
-                        }
-
-                        None
-                    }
-                    #[cfg(feature = "clipboard")]
-                    Paste => {
-                        *clipboard_read = Some((
-                            input_entity,
-                            bevy::tasks::IoTaskPool::get().spawn(async {
-                                let Ok(mut ctx) = ClipboardContext::new() else {
-                                    return Err("can't get clipboard".to_owned());
-                                };
-                                ctx.get_contents().await.map_err(|e| format!("{e:?}"))
-                            }),
-                        ));
-                        select = true;
-                        None
-                    }
-
-                    Undo => {
-                        if let Some(mut undo) = editor.undo.pop() {
-                            undo.reverse();
-                            editor.editor.finish_change();
-                            editor.editor.apply_change(&undo);
-                            editor.editor.start_change();
-                            editor.redo.push(undo);
-                        }
-
-                        is_undo_redo = true;
-                        None
-                    }
-
-                    Redo => {
-                        if let Some(mut redo) = editor.redo.pop() {
-                            redo.reverse();
-                            editor.editor.finish_change();
-                            editor.editor.apply_change(&redo);
-                            editor.editor.start_change();
-                            editor.undo.push(redo);
-                        }
-
-                        is_undo_redo = true;
-                        None
-                    }
+                    SelectAll => Some(TextEdit::SelectAll),
+                    Cut => Some(TextEdit::Cut),
+                    Copy => Some(TextEdit::Copy),
+                    Paste => Some(TextEdit::Paste),
+                    // Undo/redo are not provided by `EditableText` yet (see module docs).
+                    Undo | Redo => None,
                 };
 
-                if let Some(action) = editor_action {
-                    editor.editor.action(&mut font_system, action);
-                }
-
-                if !select {
-                    editor.editor.set_selection(Selection::None);
+                if let Some(edit) = edit {
+                    editor.queue_edit(edit);
                 }
 
                 cursor_timer.should_reset |= timer_should_reset;
@@ -837,11 +576,11 @@ fn keyboard(
 
             match input.logical_key {
                 Key::Space => {
-                    editor.editor.insert_string(" ", None);
+                    editor.queue_edit(TextEdit::Insert(" ".into()));
                     cursor_timer.should_reset = true;
                 }
                 Key::Character(ref s) => {
-                    editor.editor.insert_string(s, None);
+                    editor.queue_edit(TextEdit::Insert(s.as_str().into()));
                     cursor_timer.should_reset = true;
                 }
                 _ => (),
@@ -853,80 +592,10 @@ fn keyboard(
                 entity: input_entity,
                 value,
             });
-            editor.redo.clear();
-            editor.undo.clear();
-        } else if let Ok(mut editor) = Lazy::into_value(editor) {
-            if let Some(change) = editor.editor.finish_change() {
-                if !change.items.is_empty() && !is_undo_redo {
-                    editor.redo.clear();
-                    editor.undo.push(change);
-                }
-            }
-
-            editor.editor.shape_as_needed(&mut font_system, false);
-            editor.editor.with_buffer(|b| {
-                text_input.0 = b
-                    .lines
-                    .iter()
-                    .map(|line| format!("{}{}", line.text(), line.ending().as_str()))
-                    .collect::<Vec<_>>()
-                    .join("");
-            });
-
-            editor.update_selection_bounds();
         }
     }
 
     input_reader.clear(&input_events);
-}
-
-/// TextPositionFinder
-#[derive(SystemParam)]
-pub struct TextPositionFinder<'w, 's> {
-    block: Query<'w, 's, &'static ComputedTextBlock>,
-    reader: TextUiReader<'w, 's>,
-}
-
-impl TextPositionFinder<'_, '_> {
-    /// TextPositionFinder
-    pub fn cursor_hit(&self, entity: Entity, position: Vec2) -> Option<Cursor> {
-        let block = self.block.get(entity).ok()?;
-        let buffer = block.buffer();
-        buffer.hit(position.x, position.y)
-    }
-
-    /// TextPositionFinder
-    pub fn cursor_entity(&mut self, entity: Entity, position: Vec2) -> Option<(Entity, usize)> {
-        let Cursor {
-            mut line,
-            mut index,
-            ..
-        } = self.cursor_hit(entity, position)?;
-        for (entity, _, text, _, _, _) in self.reader.iter(entity) {
-            let mut parts = text.split('\n');
-            let line_breaks = parts.clone().count() - 1;
-            if line_breaks < line {
-                line -= line_breaks;
-                continue;
-            }
-
-            let entity_line_offset: usize = parts.by_ref().take(line).map(|text| text.len()).sum();
-            line = 0;
-
-            let len = parts.next().unwrap().len();
-            if len > index {
-                return Some((entity, entity_line_offset + index));
-            } else {
-                index -= len;
-            }
-
-            if parts.next().is_some() {
-                panic!();
-            }
-        }
-
-        None
-    }
 }
 
 /// TextInputPointerAction
@@ -953,16 +622,21 @@ pub struct TextInputPointerEvent {
 fn pointer(
     mut events: MessageReader<TextInputPointerEvent>,
     mut last_action: Local<Option<(Entity, f32, usize)>>,
-    mut buffers: Query<(&TextInputInactive, Entity, &mut CosmicEditor)>,
-    mut font_system: ResMut<CosmicFontSystem>,
-    inner_text: InnerText,
+    mut buffers: Query<(
+        &TextInputInactive,
+        Entity,
+        &mut EditableText,
+        &ComputedNode,
+        &UiGlobalTransform,
+    )>,
+    ui_scale: Res<UiScale>,
     time: Res<Time>,
-    helper: TransformHelper,
 ) {
     for event in events.read() {
         let time = time.elapsed_secs();
 
-        let Some((_, entity, mut editor)) = buffers.iter_mut().find(|(inactive, ..)| !inactive.0)
+        let Some((_, entity, mut editor, node, transform)) =
+            buffers.iter_mut().find(|(inactive, ..)| !inactive.0)
         else {
             continue;
         };
@@ -974,71 +648,64 @@ fn pointer(
             .map(|(_, _, c)| c)
             .unwrap_or(0);
 
-        editor.editor.with_buffer_mut(|b| {
-            b.clone_from(&inner_text.computed_text(entity).unwrap().buffer().0)
-        });
-        editor.editor.shape_as_needed(&mut font_system, false);
-
-        let top_left = helper
-            .compute_global_transform(inner_text.inner_entity(entity).unwrap())
-            .unwrap()
-            .translation()
-            .xy()
-            - inner_text.computed_node(entity).unwrap().size() * 0.5;
-        let relative_position = event.position - top_left;
-        let Some(cursor) = editor
-            .editor
-            .with_buffer(|b| b.hit(relative_position.x, relative_position.y))
-        else {
+        // Map the screen-space pointer position into the editor's local text
+        // layout space (origin at the top-left of the content box).
+        let Some(local_pos) = transform.try_inverse().map(|inverse| {
+            inverse.transform_point2(event.position / ui_scale.0) - node.content_box().min
+        }) else {
             continue;
         };
 
         match event.action {
             TextInputPointerAction::Release => (),
             TextInputPointerAction::Press => {
-                editor.editor.set_cursor(cursor);
-                editor.editor.set_selection(match click_count {
-                    0 => Selection::Normal(cursor),
-                    1 => Selection::Word(cursor),
-                    _ => Selection::Line(cursor),
-                });
+                let edit = match click_count {
+                    0 => TextEdit::MoveToPoint(local_pos),
+                    1 => TextEdit::SelectWordAtPoint(local_pos),
+                    _ => TextEdit::SelectLineAtPoint(local_pos),
+                };
+                editor.queue_edit(edit);
                 *last_action = Some((entity, time, click_count + 1));
             }
             TextInputPointerAction::Drag => {
                 if click_count > 0 {
-                    editor.editor.set_cursor(cursor);
+                    editor.queue_edit(TextEdit::ExtendSelectionToPoint(local_pos));
                 }
             }
         }
-
-        editor.update_selection_bounds();
     }
 }
 
+/// Reads the current text out of each [`EditableText`] back into [`TextInputValue`].
 fn update_value(
-    mut input_query: Query<
-        (
-            Entity,
-            Ref<TextInputValue>,
-            &TextInputSettings,
-            &CosmicEditor,
-        ),
-        Or<(Changed<TextInputValue>, Changed<CosmicEditor>)>,
-    >,
-    inner_text: InnerText,
-    mut writer: TextUiWriter,
+    mut input_query: Query<(&mut TextInputValue, &EditableText), Changed<EditableText>>,
 ) {
-    for (entity, text_input, settings, editor) in &mut input_query {
-        let Some(inner_entity) = inner_text.inner_entity(entity) else {
-            continue;
-        };
+    for (mut text_input, editor) in &mut input_query {
+        let value = editor.value().to_string();
+        if text_input.0 != value {
+            text_input.0 = value;
+        }
+    }
+}
 
-        let mut section_values = section_values(
-            &text_input.0,
-            editor.selection_bounds,
-            settings.mask_character,
-        );
-        writer.for_each_text(inner_entity, |mut t| *t = section_values.next().unwrap());
+/// Pushes the latest [`TextInputValue`] into the [`EditableText`] when it is
+/// changed externally (e.g. the app resets the field).
+fn sync_settings(
+    mut input_query: Query<
+        (&TextInputValue, &TextInputSettings, &mut EditableText),
+        Or<(Changed<TextInputValue>, Changed<TextInputSettings>)>,
+    >,
+) {
+    for (value, settings, mut editor) in &mut input_query {
+        editor.allow_newlines = settings.multiline;
+
+        // Only overwrite the editor's text if the external value diverged. This
+        // happens when the app sets `TextInputValue` directly; ordinary typing
+        // flows the other way (editor -> value) via `update_value`.
+        if editor.value().to_string() != value.0 {
+            editor.editor.set_text(&value.0);
+            editor.queue_edit(TextEdit::TextEnd(false));
+        }
     }
 }
 
@@ -1052,78 +719,15 @@ fn create(
         &TextInputInactive,
         &TextInputSettings,
         &TextInputPlaceholder,
+        &TextInputSelectionStyle,
     )>,
 ) {
     let target = trigger.event().entity;
-    if let Ok((font, color, text_input, inactive, settings, placeholder)) = &query.get(target) {
-        let value = masked_value(&text_input.0, settings.mask_character);
-
-        let text = commands
-            .spawn((
-                // pre-selection
-                Text::new(value),
-                font.0.clone(),
-                color.0,
-                Node {
-                    min_width: Val::Percent(100.0),
-                    min_height: Val::Percent(100.0),
-                    ..Default::default()
-                },
-                TextLayout::new_with_linebreak(if settings.multiline {
-                    LineBreak::WordBoundary
-                } else {
-                    LineBreak::NoWrap
-                }),
-                Name::new("TextInputInner"),
-                TextInputInner,
-            ))
-            .with_children(|parent| {
-                // selection
-                parent.spawn((TextSpan::default(), font.0.clone(), color.0));
-                // post-selection
-                parent.spawn((TextSpan::default(), font.0.clone(), color.0));
-            })
-            .id();
-
-        let selection_hilight = commands
-            .spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    display: Display::Flex,
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    ..Default::default()
-                },
-                ZIndex(-1),
-                TextInputSelection,
-            ))
-            .id();
-
-        let cursor = commands
-            .spawn((
-                Node {
-                    display: Display::None,
-                    width: Val::Px(1f32.max(font.0.font_size * 0.05)),
-                    height: Val::Px(font.0.font_size),
-                    position_type: PositionType::Absolute,
-                    ..Default::default()
-                },
-                BackgroundColor(*color.0),
-                TextInputCursorDisplay,
-            ))
-            .id();
-
-        let container = commands
-            .spawn((
-                Node {
-                    min_height: Val::Percent(100.0),
-                    ..Default::default()
-                },
-                TextInputContainer,
-            ))
-            .add_children(&[text, selection_hilight, cursor])
-            .id();
-
+    if let Ok((font, color, text_input, inactive, settings, placeholder, selection_style)) =
+        &query.get(target)
+    {
+        // The placeholder is rendered as a separate absolutely-positioned child
+        // so it can overlay the (empty) input.
         let placeholder_font = placeholder
             .text_font
             .clone()
@@ -1138,7 +742,7 @@ fn create(
         let placeholder_text = commands
             .spawn((
                 Text::new(&placeholder.value),
-                TextLayout::new_with_linebreak(LineBreak::NoWrap),
+                TextLayout::no_wrap(),
                 placeholder_font,
                 placeholder_color,
                 Name::new("TextInputPlaceholderInner"),
@@ -1155,314 +759,58 @@ fn create(
             ))
             .id();
 
-        let overflow_container = commands
-            .spawn((
-                Node {
-                    overflow: if settings.multiline {
-                        Overflow::scroll()
-                    } else {
-                        Overflow::scroll_x()
-                    },
-                    justify_content: JustifyContent::FlexStart,
-                    align_items: AlignItems::FlexStart,
-                    min_width: Val::Percent(100.),
-                    max_width: Val::Percent(100.),
-                    min_height: Val::Percent(100.),
-                    max_height: Val::Percent(100.),
-                    ..default()
-                },
-                Name::new("TextInputOverflowContainer"),
-            ))
-            .id();
+        commands.entity(target).add_children(&[placeholder_text]);
 
-        commands.entity(overflow_container).add_child(container);
-        commands
-            .entity(target)
-            .add_children(&[overflow_container, placeholder_text]);
+        // Turn the input entity itself into a native editable-text node. Bevy's
+        // `bevy_ui`/`bevy_ui_render` will render the text, cursor and selection
+        // for us, styled by the `TextFont`/`TextColor`/`TextCursorStyle`
+        // components inserted below.
+        let mut editor = EditableText::new(&text_input.0);
+        editor.allow_newlines = settings.multiline;
 
-        // Prevent clicks from registering on UI elements underneath the text input.
-        commands
-            .entity(target)
-            // .insert(FocusPolicy::Block)
-            .insert(CosmicEditor::new(&text_input.0));
+        commands.entity(target).insert((
+            editor,
+            font.0.clone(),
+            color.0,
+            TextLayout::linebreak(if settings.multiline {
+                LineBreak::WordBoundary
+            } else {
+                LineBreak::NoWrap
+            }),
+            cursor_style(color, selection_style),
+            TextInputInner,
+            Name::new("TextInputInner"),
+        ));
     }
 }
 
-// Shows or hides the cursor based on the text input's [`TextInputInactive`] property.
-fn set_positions(
+fn cursor_style(
+    color: &TextInputTextColor,
+    selection_style: &TextInputSelectionStyle,
+) -> TextCursorStyle {
+    let base = TextCursorStyle::default();
+    let selection_color = selection_style.background.unwrap_or(base.selection_color);
+    TextCursorStyle {
+        color: *color.0,
+        selection_color,
+        unfocused_selection_color: selection_color,
+        selected_text_color: selection_style.color,
+    }
+}
+
+fn sync_inactive(
     mut input_query: Query<
-        (
-            Entity,
-            &TextInputSettings,
-            &mut TextInputCursorTimer,
-            &TextInputInactive,
-            &mut CosmicEditor,
-        ),
-        Or<(
-            Changed<TextInputInactive>,
-            Changed<TextInputTextFont>,
-            Changed<CosmicEditor>,
-        )>,
+        (&TextInputInactive, &mut EditableText, &mut TextCursorStyle),
+        Changed<TextInputInactive>,
     >,
-    mut inner_style_query: Query<
-        (&mut Node, &ComputedNode),
-        (Without<TextInputCursorDisplay>, With<TextInputContainer>),
-    >,
-
-    mut container_query: Query<
-        &ComputedNode,
-        (Without<TextInputCursorDisplay>, Without<TextInputContainer>),
-    >,
-    mut inner_text: InnerText,
-    children: Query<&Children>,
-    mut font_system: ResMut<CosmicFontSystem>,
 ) {
-    let px = |val: Val| match val {
-        Val::Px(px) => px,
-
-        _ => 0.0,
-    };
-
-    for (entity, settings, mut cursor_timer, inactive, mut editor) in &mut input_query {
+    for (inactive, mut editor, mut cursor) in &mut input_query {
         if inactive.0 {
-            let Some(cursor_style) = inner_text.cursor_style(entity) else {
-                continue;
-            };
-
-            cursor_style.0.display = Display::None;
-            continue;
-        }
-
-        let inverse_scale_factor = inner_text
-            .computed_node(entity)
-            .map(ComputedNode::inverse_scale_factor)
-            .unwrap_or(1.0);
-
-        let Some((mut container_style, child_node)) = children
-            .iter_descendants(entity)
-            .find(|e| inner_style_query.get(*e).is_ok())
-            .and_then(|e| inner_style_query.get_mut(e).ok())
-        else {
-            continue;
-        };
-
-        let Some(parent_node) = children
-            .iter_descendants(entity)
-            .find(|e| container_query.get(*e).is_ok())
-            .and_then(|e| container_query.get_mut(e).ok())
-        else {
-            continue;
-        };
-
-        if font_system.0.db().is_empty() {
-            editor.set_changed();
-            continue;
-        }
-
-        let editor = editor.bypass_change_detection();
-
-        editor.editor.with_buffer_mut(|b| {
-            b.clone_from(&inner_text.computed_text(entity).unwrap().buffer().0);
-        });
-        // we need to reset the cursor position if it's invalid, else shape will fail
-        if editor.editor.cursor_position().is_none() {
-            editor.editor.action(
-                &mut font_system,
-                Action::Motion(cosmic_text::Motion::BufferEnd),
-            );
-        }
-        editor.editor.shape_as_needed(&mut font_system, false);
-
-        let cursor_position = IVec2::from(editor.editor.cursor_position().unwrap_or((0, 0)))
-            .as_vec2()
-            * inverse_scale_factor;
-
-        let child_size = child_node.size();
-        let parent_size = parent_node.size();
-
-        let box_pos_x = match container_style.left {
-            Val::Px(px) => -px,
-            _ => 0.0,
-        };
-
-        let box_pos_y = match container_style.top {
-            Val::Px(px) => -px,
-            _ => 0.0,
-        };
-
-        let Some(cursor_style) = inner_text.cursor_style(entity) else {
-            continue;
-        };
-
-        let relative_cursor_position = cursor_position - Vec2::new(box_pos_x, box_pos_y);
-        let cursor_size = Vec2::new(
-            px(cursor_style.0.width) + 1.0,
-            px(cursor_style.0.height) + 1.0,
-        );
-
-        // println!("cs.top: {:?}", container_style.top);
-        // println!("box: ({box_pos_x},{box_pos_y}, cursor: {cursor_position}, rcp: {relative_cursor_position}");
-        if relative_cursor_position.cmplt(Vec2::ZERO).any()
-            || (relative_cursor_position + cursor_size)
-                .cmpgt(parent_size)
-                .any()
-        {
-            // println!("update");
-            let req_px = parent_size * 0.5 - cursor_position;
-            let mut req_px =
-                req_px.clamp(parent_size - child_size - cursor_size * Vec2::X, Vec2::ZERO);
-            if settings.multiline {
-                req_px.x = 0.0;
-            }
-            container_style.left = Val::Px(req_px.x);
-            container_style.top = Val::Px(req_px.y);
-        }
-        // println!(
-        //     "parent_size: {parent_size}, child_size: {child_size}, cursor_position: {cursor_position}, req_unclamped: {}, req_px: {}",
-        //     parent_size * 0.5 - cursor_position,
-        //     (parent_size * 0.5 - cursor_position)
-        //         .clamp(parent_size - child_size - cursor_size * Vec2::X, Vec2::ZERO)
-        // );
-
-        cursor_style.0.display = if editor
-            .selection_bounds
-            .is_some_and(|(start, end)| start != end)
-        {
-            Display::None
+            // Collapse selection and hide highlight while inactive.
+            editor.queue_edit(TextEdit::CollapseSelection);
+            cursor.unfocused_selection_color = Color::NONE;
         } else {
-            Display::Flex
-        };
-
-        cursor_style.0.left = Val::Px(cursor_position.x);
-        cursor_style.0.top = Val::Px(cursor_position.y + px(cursor_style.0.height) * 0.1);
-
-        cursor_timer.timer.reset();
-    }
-}
-
-fn set_selection(
-    mut query: Query<(Entity, &mut CosmicEditor, &TextInputSelectionStyle), Changed<CosmicEditor>>,
-    children: Query<&Children>,
-    sel: Query<&TextInputSelection>,
-    inner_text: InnerText,
-    mut commands: Commands,
-    mut font_system: ResMut<CosmicFontSystem>,
-) {
-    for (entity, mut editor, style) in query.iter_mut() {
-        let Some(selection) = children
-            .iter_descendants(entity)
-            .find(|c| sel.get(*c).is_ok())
-        else {
-            continue;
-        };
-
-        let editor = editor.bypass_change_detection();
-
-        commands.entity(selection).despawn_related::<Children>();
-
-        if let Some((from, to)) = editor.editor.selection_bounds() {
-            let mut segments = Vec::default();
-
-            editor.editor.with_buffer_mut(|b| {
-                b.shape_until_cursor(&mut font_system, to, false);
-
-                let mut segment_y = f32::NEG_INFINITY;
-
-                let runs = b
-                    .layout_runs()
-                    .skip_while(|run| run.line_i < from.line)
-                    .take_while(|run| run.line_i <= to.line);
-
-                for run in runs {
-                    let glyphs = run
-                        .glyphs
-                        .iter()
-                        .skip_while(|g| run.line_i == from.line && g.start < from.index)
-                        .take_while(|g| run.line_i < to.line || g.end <= to.index);
-
-                    for glyph in glyphs {
-                        debug!("g: {},{}", glyph.x, glyph.y);
-
-                        if run.line_top + glyph.y != segment_y {
-                            segments.push(Vec4::new(
-                                glyph.x,
-                                run.line_top + glyph.y,
-                                glyph.w,
-                                run.line_height,
-                            ));
-
-                            segment_y = glyph.y;
-                        } else {
-                            let segment = segments.last_mut().unwrap();
-
-                            segment.z = glyph.x + glyph.w - segment.x;
-                        }
-                    }
-                }
-            });
-
-            let inverse_scale_factor = inner_text
-                .computed_node(entity)
-                .map(ComputedNode::inverse_scale_factor)
-                .unwrap_or(1.0);
-
-            commands.entity(selection).with_children(|c| {
-                for segment in segments {
-                    c.spawn((
-                        Node {
-                            position_type: PositionType::Absolute,
-                            left: Val::Px((segment.x * inverse_scale_factor).floor()),
-                            top: Val::Px((segment.y * inverse_scale_factor).floor()),
-                            width: Val::Px((segment.z * inverse_scale_factor).ceil()),
-                            height: Val::Px((segment.w * inverse_scale_factor).ceil()),
-                            ..Default::default()
-                        },
-                        BackgroundColor(style.background.unwrap_or(Color::srgb(0.3, 0.3, 1.0))),
-                    ));
-                }
-            });
-        }
-    }
-}
-
-// Blinks the cursor on a timer.
-fn blink_cursor(
-    mut input_query: Query<(
-        Entity,
-        &mut TextInputCursorTimer,
-        Ref<TextInputInactive>,
-        &CosmicEditor,
-    )>,
-    mut inner_text: InnerText,
-    time: Res<Time>,
-) {
-    for (entity, mut cursor_timer, inactive, editor) in &mut input_query {
-        if inactive.0 {
-            continue;
-        }
-
-        if cursor_timer.is_changed() && cursor_timer.should_reset {
-            cursor_timer.timer.reset();
-            cursor_timer.should_reset = false;
-            continue;
-        }
-
-        if !cursor_timer.timer.tick(time.delta()).just_finished() {
-            continue;
-        }
-
-        let Some(style) = inner_text.cursor_style(entity) else {
-            continue;
-        };
-
-        style.0.display = match (
-            editor
-                .selection_bounds
-                .is_some_and(|(start, end)| start != end),
-            style.0.display,
-        ) {
-            (false, Display::None) => Display::Flex,
-            _ => Display::None,
+            cursor.unfocused_selection_color = cursor.selection_color;
         }
     }
 }
@@ -1486,133 +834,33 @@ fn show_hide_placeholder(
     }
 }
 
-fn update_style(
+#[allow(clippy::type_complexity)]
+fn sync_style(
     mut input_query: Query<
         (
-            Entity,
             &TextInputTextFont,
             &TextInputTextColor,
             &TextInputSelectionStyle,
-            &mut TextInputInactive,
+            &mut TextFont,
+            &mut TextColor,
+            &mut TextCursorStyle,
         ),
         Or<(
-            Changed<TextInputInactive>,
             Changed<TextInputTextFont>,
-            Changed<TextInputSelectionStyle>,
             Changed<TextInputTextColor>,
+            Changed<TextInputSelectionStyle>,
         )>,
     >,
-    mut inner_text: InnerText,
-    mut writer: TextUiWriter,
 ) {
-    for (entity, font, color, selection_style, mut inactive) in &mut input_query {
-        let Some(inner_entity) = inner_text.inner_entity(entity) else {
-            continue;
-        };
-
-        for index in [0, 2] {
-            writer.font(inner_entity, index).clone_from(&font.0);
-            writer.color(inner_entity, index).clone_from(&color.0);
-        }
-        writer.font(inner_entity, 1).clone_from(&font.0);
-        writer
-            .color(inner_entity, 1)
-            .0
-            .clone_from(selection_style.color.as_ref().unwrap_or(&color.0));
-
-        let Some(cursor) = inner_text.cursor_style(entity) else {
-            continue;
-        };
-
-        cursor.0.width = Val::Px(1f32.max(font.0.font_size * 0.05));
-        cursor.0.height = Val::Px(font.0.font_size);
-        cursor.1.0 = *color.0;
-
-        inactive.set_changed()
+    for (font, color, selection_style, mut text_font, mut text_color, mut cursor) in
+        &mut input_query
+    {
+        text_font.clone_from(&font.0);
+        *text_color = color.0;
+        *cursor = cursor_style(color, selection_style);
     }
-}
-
-fn masked_value(value: &str, mask: Option<char>) -> String {
-    mask.map_or_else(
-        || value.to_string(),
-        |c| value.chars().map(|_| c).collect::<String>(),
-    )
 }
 
 fn placeholder_color(color: &TextColor) -> TextColor {
     TextColor(color.with_alpha(color.alpha() * 0.25))
-}
-
-fn update_placeholder_style(
-    mut placeholder_query: Query<
-        (
-            &TextInputPlaceholder,
-            &TextInputTextFont,
-            &TextInputTextColor,
-            &Children,
-            &mut TextInputInactive,
-        ),
-        Changed<TextInputPlaceholder>,
-    >,
-
-    mut placeholders: Query<
-        (&mut Text, &mut TextFont, &mut TextColor),
-        With<TextInputPlaceholderInner>,
-    >,
-) {
-    for (placeholder, base_font, base_color, children, mut inactive) in &mut placeholder_query {
-        let Some((mut text, mut font, mut color)) = children
-            .iter()
-            .find(|c| placeholders.get(*c).is_ok())
-            .and_then(|c| placeholders.get_mut(c).ok())
-        else {
-            continue;
-        };
-
-        font.clone_from(placeholder.text_font.as_ref().unwrap_or(&base_font.0));
-        *color = placeholder
-            .text_color
-            .clone()
-            .unwrap_or_else(|| placeholder_color(&base_color.0));
-        text.0 = placeholder.value.clone();
-
-        // mark so other systems update correctly
-        inactive.set_changed()
-    }
-}
-
-fn section_values(
-    value: &str,
-    bounds: Option<(usize, usize)>,
-    mask_character: Option<char>,
-) -> impl Iterator<Item = String> {
-    let bounds = bounds.map(|(from, to)| {
-        let to = to.min(value.len());
-        let from = from.min(to);
-        (from, to)
-    });
-
-    let vec = match bounds {
-        Some((start, end)) if start != end => {
-            vec![
-                masked_value(&value[0..start], mask_character),
-                masked_value(&value[start..end], mask_character),
-                masked_value(&value[end..], mask_character),
-            ]
-        }
-
-        _ => {
-            vec![
-                masked_value(value, mask_character),
-                String::default(),
-                if value.is_empty() {
-                    String::from("\n")
-                } else {
-                    String::default()
-                },
-            ]
-        }
-    };
-
-    vec.into_iter()
 }

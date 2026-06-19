@@ -142,3 +142,134 @@ and `cargo build --no-default-features --features std`. The only remaining
 `cargo clippy` notes (a `.clone()` on a `Copy` `Option<TextColor>` and two
 collapsible `if`s) are pre-existing on the 0.17 branch in unchanged code and are
 unrelated to the port.
+
+---
+
+# Port notes: bevy 0.18 -> 0.19 (the Parley swap)
+
+This branch (`0.19`) ports the crate to Bevy 0.19.0 (crates.io). This is **not**
+a mechanical bump: Bevy 0.19 replaced its text engine, **Cosmic Text -> Parley**,
+which removed every primitive the previous internals were built on.
+
+## What broke
+
+The 0.17/0.18 internals drove a `cosmic_text::Editor<'static>` (wrapped in a
+private `CosmicEditor` component) for all cursor/selection/edit logic, and read
+cursor geometry + selection rectangles by cloning Bevy's shaped buffer
+(`ComputedTextBlock::buffer().0`, a `cosmic_text::Buffer`) into that editor and
+walking `layout_runs()`/glyphs. In 0.19:
+
+- `bevy::text::{CosmicBuffer, CosmicFontSystem}` — **removed**. There is no
+  cosmic-text `Buffer`/`FontSystem` in `bevy_text` anymore.
+- `ComputedTextBlock::buffer()` now returns `&parley::Layout<TextBrush>`, not a
+  cosmic `Buffer`. `layout_runs()`, `.hit()`, `Cursor`, `cursor_position()`,
+  `selection_bounds()`, `shape_as_needed()`, `Action`, `Change`, `Selection`,
+  `Motion`, `Edit` — none of these exist on the Parley types.
+- There is no longer any cosmic-text re-export from `bevy::text`.
+
+In short: the entire editing core was non-portable as-is.
+
+## Approach taken: rebuild on Bevy's native `EditableText`
+
+Bevy 0.19 ships a first-class editable-text widget in `bevy_text`:
+`EditableText` (a component wrapping a `parley::PlainEditor<TextBrush>`),
+`TextEdit` (a deferred edit/navigation action enum), `TextCursorStyle`, and an
+`apply_text_edits` system (added by `TextPlugin`, part of `DefaultPlugins`) that
+applies queued edits using the same `FontCx`/`LayoutCx` Bevy uses for layout.
+`bevy_ui` + `bevy_ui_render` render the text, **cursor and selection** natively
+when an `EditableText` sits on a UI node.
+
+Rather than (a) vendoring `cosmic-text` as a second, independent shaper — which
+would diverge from Bevy's Parley fonts and produce wrong cursor/selection
+geometry — or (b) hand-rolling cursor math against Parley, this branch
+**re-implements the crate's internals as a thin facade over `EditableText`**:
+
+- The `TextInput` entity *is* the `EditableText` node now. `create` inserts
+  `EditableText::new(value)` plus `TextFont`/`TextColor`/`TextLayout`/
+  `TextCursorStyle` on the target entity; Bevy renders text, cursor and
+  selection. The old hand-built inner `Text` + 3 `TextSpan`s + manual
+  selection-rectangle nodes + manual cursor node + blink/scroll systems are all
+  gone (Bevy does this now).
+- `keyboard` maps each bound `TextInputAction` to a `TextEdit` and calls
+  `EditableText::queue_edit(...)`; `bevy_text::apply_text_edits` applies them.
+- `pointer` maps `TextInputPointerEvent` press/drag/multi-click to
+  `TextEdit::MoveToPoint` / `SelectWordAtPoint` / `SelectLineAtPoint` /
+  `ExtendSelectionToPoint`, converting screen-space to the editor's local text
+  space via `UiGlobalTransform` + `ComputedNode::content_box()` + `UiScale`.
+- `update_value` reads `EditableText::value()` back into `TextInputValue`;
+  `sync_settings` pushes externally-set `TextInputValue` into the editor and
+  maps `multiline` onto `EditableText::allow_newlines`.
+- Submit (Enter without Shift, in single-line mode) still fires
+  `TextInputSubmitEvent` and clears/keeps text per `retain_on_submit`.
+- Placeholder is still a separate absolutely-positioned child `Text` toggled by
+  `show_hide_placeholder` (Parley/`EditableText` has no native placeholder).
+
+### Required-components gotcha
+
+`EditableText`'s render path needs `TextScroll`, `TextNodeFlags` and
+`ContentSize` on the same entity, but Bevy only registers those as *required
+components* inside `bevy_ui_widgets::EditableTextInputPlugin`. We deliberately do
+**not** add that plugin (it installs Bevy's own keyboard/pointer/focus handling
+via `bevy_picking`/`bevy_input_focus`, which would fight this crate's custom
+input model and the app's `TextInputInactive`-based focus). Instead
+`TextInputPlugin::build` registers those required components itself, so rendering
+works under a plain `DefaultPlugins` app.
+
+## Public API: preserved
+
+All public items the app (`ui_core/text_entry.rs`) imports are unchanged in name
+and shape: `TextInput`, `TextInputPlugin`, `TextInputSystem`, `TextInputValue`,
+`TextInputSettings`, `TextInputInactive`, `TextInputCursorTimer`,
+`TextInputTextFont`, `TextInputTextColor`, `TextInputSelectionStyle`,
+`TextInputPlaceholder`, `TextInputSubmitEvent`, `TextInputPointerEvent`,
+`TextInputPointerAction`, `TextInputNavigationBindings`, `TextInputAction`,
+`TextInputBinding`. No downstream import changes are required for these types.
+
+### One downstream change the *app* must make (not this crate)
+
+`TextFont.font_size` changed from `f32` to the new `FontSize` enum in 0.19. The
+app's `update_fontsize` system in `ui_core/src/text_entry.rs` does
+`text.0.font_size = win_size * size.0;` (assigning an `f32`); on 0.19 that must
+become `text.0.font_size = FontSize::Px(win_size * size.0);`. This is part of the
+app's own 0.18->0.19 migration, not this crate. The crate's examples were updated
+the same way (`font_size: 34.` -> `font_size: FontSize::Px(34.)`).
+
+## Behaviour changes / gaps vs the 0.18 branch
+
+These are limitations of the current native `EditableText`, surfaced honestly
+rather than faked:
+
+- **Masking (`TextInputSettings::mask_character`)**: NOT honoured. `EditableText`
+  renders its own buffer and has no masking hook, so the `password` example now
+  shows plaintext. The field is still accepted (no compile break) and is the
+  obvious follow-up if password fields are needed (would require either a custom
+  glyph brush or rendering a masked mirror string).
+- **Undo / redo (`TextInputAction::Undo`/`Redo`)**: now no-ops. The old
+  cosmic-text `Change`/`apply_change` undo stack has no `PlainEditor` equivalent
+  yet; the bindings remain but do nothing.
+- **`TextInputCursorTimer`**: retained as a component (the app inserts it) but no
+  longer drives a custom blink system — Bevy's native cursor handles blinking
+  via `EditableText::cursor_blink_period`.
+- **`TextPositionFinder`** (public `SystemParam` that did cosmic hit-testing):
+  removed. It depended entirely on `ComputedTextBlock::buffer().hit()` /
+  `layout_runs()`, which no longer exist. It was not used by the app.
+- The `clipboard` feature no longer pulls `copypwasmta`/`futures-lite`; copy/cut/
+  paste are now native (`EditableText` + `bevy/system_clipboard`). The feature is
+  kept (default-on) and just enables `bevy/system_clipboard`.
+
+## Cargo.toml
+
+- `bevy` bumped `0.18.1` -> `0.19.0` (deps + dev-deps). Added the
+  `bevy_ui_render` feature (needed for native cursor/selection rendering).
+- Dropped the direct `cosmic-text` dependency (no longer compatible / unused).
+- Dropped `once_cell` (the lazy-editor trick it supported is gone).
+- Dropped `copypwasmta` + `futures-lite`; `clipboard` feature now just enables
+  `bevy/system_clipboard`.
+
+## Build status (0.19)
+
+Clean (no warnings) under dcl-shell with `cargo build`, `cargo build --examples`,
+and `cargo build --no-default-features --features std`. `cargo clippy
+--all-targets` is also clean. Runtime/visual verification of the native
+cursor/selection rendering against the full app (via `dcl-bevy`) is a follow-up;
+the headless build environment here has no display to open a window.

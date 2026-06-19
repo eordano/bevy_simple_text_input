@@ -46,7 +46,7 @@ fn setup(mut commands: Commands) {
                 BackgroundColor::from(BACKGROUND_COLOR),
                 TextInput,
                 TextInputTextFont(TextFont {
-                    font_size: 20.,
+                    font_size: FontSize::Px(20.),
                     ..Default::default()
                 }),
                 TextInputTextColor(TextColor(TEXT_COLOR)),
