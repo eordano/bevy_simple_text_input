@@ -80,7 +80,7 @@ feature configuration builds warning-free.
 
 ## Build status
 
-Clean (no warnings) under dcl-shell with `cargo build`, `cargo build --examples`,
+Clean (no warnings) with `cargo build`, `cargo build --examples`,
 and `cargo build --no-default-features --features std`.
 
 ---
@@ -137,7 +137,7 @@ needed changing, and it doesn't insert/read a `LineHeight` component directly.
 
 ## Build status (0.18)
 
-Clean (no warnings) under dcl-shell with `cargo build`, `cargo build --examples`,
+Clean (no warnings) with `cargo build`, `cargo build --examples`,
 and `cargo build --no-default-features --features std`. The only remaining
 `cargo clippy` notes (a `.clone()` on a `Copy` `Option<TextColor>` and two
 collapsible `if`s) are pre-existing on the 0.17 branch in unchanged code and are
@@ -268,7 +268,7 @@ rather than faked:
 
 ## Build status (0.19)
 
-Clean (no warnings) under dcl-shell with `cargo build`, `cargo build --examples`,
+Clean (no warnings) with `cargo build`, `cargo build --examples`,
 and `cargo build --no-default-features --features std`. `cargo clippy
 --all-targets` is also clean. Runtime/visual verification of the native
 cursor/selection rendering against the full app (via `dcl-bevy`) is a follow-up;
